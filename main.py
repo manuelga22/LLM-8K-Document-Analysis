@@ -1,17 +1,11 @@
 import json
-import pprint
 import re
 import subprocess
-import time
-
 import requests
 from bs4 import BeautifulSoup as bs
 
-
-
-# LLAMA_MODEL = "llama3.2"
-LLAMA_MODEL = "deepseek-r1:8b"
-# CHAR_LIMIT = 2400
+KEYWORDS = ['announced', 'new', 'product', 'launch', 'launched', 'release', 'version']
+LLAMA_MODEL = "llama3.2"
 
 def get_data_from_url(url):
     headers = {
@@ -45,38 +39,50 @@ def get_8k_filing_content(filing_details_url):
         response = get_data_from_url(filing_details_url)
         response_soup = bs(response.text, 'html.parser')
         table = response_soup.find('table')
-        link = query_ollama(LLAMA_MODEL, f"Find the link in this html table to the 8K filing. "
-                                                f"Reply with just the link and nothing else."
-                                                f"if you can't find it, just reply \"NA\" and nothing else"
-                                                f"\n\n {table}")
-        if 'NA' in link:
+        links = query_ollama(LLAMA_MODEL, f"Give me a comma separated list of all the links in this table. "
+                                                 f"make sure you include http://www.sec.gov/ before all the links "
+                                                 f"Reply with just the links and nothing else."
+                                                 f"if you can't find them, just reply \"NA\" and nothing else"
+                                                 f"\n\n {table}")
+
+        if 'NA' in links:
             return None
 
-        content_8k_filing = get_data_from_url(link)
-        file_content = bs(content_8k_filing.text, 'html.parser')
+        text_excerpts = []
+        for link in links.split(','):
+            if '.jpg' in link: continue
 
-        # We truncate it bc sometimes the file is too long and can't fit into a llama prompt
-        file = truncate_8k_filing(file_content.text.strip().replace('\n',' '))
+            content_8k_filing = get_data_from_url(link)
+            file_content = bs(content_8k_filing.text, 'html.parser')
+            file_text = file_content.text.strip().replace('\n', '')
 
-        is_8k_filing = query_ollama(LLAMA_MODEL, f"does this text look like an 8-K filing? "
-                                                         f"just reply yes or no and nothing else \n\n {file}")
-
-        if is_8k_filing == 'no':
-            return None
-
-        return file
+            for keyword in KEYWORDS:
+                meaningful_text_excerpts = find_surrounding_text(file_text, keyword)
+                text_excerpts.append(meaningful_text_excerpts)
+        return text_excerpts
 
     except Exception as e:
         return None
 
-def truncate_8k_filing(filing):
-    try:
-        pattern = r'FORM\s+8-K.*$'
-        match = re.search(pattern, filing, re.DOTALL)
-        return match.group(0)
-    except Exception as e:
-        print(f"could not truncate filing")
-        return filing
+def find_surrounding_text(text, keyword, window_size=80):
+    import re
+
+    # Find all occurrences of the keyword in the text
+    matches = [match.start() for match in re.finditer(re.escape(keyword), text)]
+
+    # Extract surrounding text for each match
+    surrounding_texts = []
+    for match in matches:
+        start = max(0, match - window_size)
+        end = min(len(text), match + len(keyword) + window_size)
+        surrounding_texts.append(text[start:end])
+
+    return surrounding_texts
+
+def write_to_output_csv(str):
+    with open('output.csv', 'a') as csv:
+        csv.write(str)
+
 
 if __name__ == "__main__":
 
@@ -84,7 +90,7 @@ if __name__ == "__main__":
     company_cik_values_content = get_data_from_url(company_cik_url)
     company_cik_values_json = company_cik_values_content.json()
 
-    # Making a dictionary of company tickers to cik
+    # Making a dictionary of company tickers as keys and ciks as values
     company_ciks_dict = {}
     for key, value in company_cik_values_json.items():
         company_ciks_dict[value['ticker']] = value['cik_str']
@@ -92,7 +98,7 @@ if __name__ == "__main__":
     with open('output.csv', 'w') as f:
          f.write('company_name | stock_name | filing_time | new_product | product_description\n')
 
-    
+    # Iterating through every company in our dictionary
     for ticker, cik in company_ciks_dict.items():
 
         print(f"Getting 8k filings for {ticker}\n")
@@ -121,51 +127,73 @@ if __name__ == "__main__":
 
             # if items 8.01 and 9.01 or 8.02 are not present in the 8k,
             # it's very unlikely that there is a product launch in the filing
+            # so we skip them
             if '8.01' not in new_items and '9.01' not in new_items and '8.02' not in new_items:
                 continue
 
-            filing_date = query_ollama(LLAMA_MODEL, f"Extract the filing date of this 8-K filing from the "
-                                                           f"<filing-date> tag. "
-                                                            f"Reply with just the date in the format yyyy-mm-dd or "
+            # Find the filing date
+            filing_date = query_ollama(LLAMA_MODEL,  f"Extract the filing date of this 8-K filing from the "
+                                                            f"<filing-date> tag. "
+                                                            f"Reply only with the text inside the tags "
                                                             f"\"NA\" if you can't find it. "
                                                             f"\n\n {entry}")
-
-
             if filing_date == 'NA' or company_name == 'NA':
                 continue
 
+            #  Get the link to the actual 8-K filing from the entry
             filing_detail_link = query_ollama(LLAMA_MODEL, f"This is text in xml format. Please extract the text "
                                                            f"inside of the 'filing-href' tag and give it back to me. "
                                                            f"Reply only with the text inside the tags\n\n {entry}")
+
+            # Get the relevant content that we want to analize
             filing_content = get_8k_filing_content(filing_detail_link)
-            if filing_content is None:
+            if filing_content is None or not filing_content:
                 continue
 
-            print(company_name, filing_date)
-            product_launches_lookup_prompt = f"Look in this 8-K form filing to see if there are new product launches. "\
-                                             f"If there aren't any, just reply \"NA\" and nothing else" \
-                                             f"keep the answer short. " \
-                                             f"\n\n {filing_content}"
+            # Analize the excerpts that we found and could contain new products
+            for text_excerpts in filing_content:
+                product_launches_lookup_prompt =  f"Does this 8-K form filing excerpt for {company_name} "\
+                                                  f"say that a product is being launched or announced? "\
+                                                  f"Only reply with yes or no, do not say anything else " \
+                                                  f"\n\n {text_excerpts}"
 
-            product_lookup = query_ollama(LLAMA_MODEL, product_launches_lookup_prompt)
+                product_lookup = query_ollama(LLAMA_MODEL, product_launches_lookup_prompt)
+                if product_lookup == 'no' or product_lookup == 'No' or product_lookup == 'no.':
+                    continue
 
-            if product_lookup == 'NA':
-                continue
+                # Find the names of the products being launched
+                product_name_lookup_prompt = f"Take a look at this 8-k and tell me the full name of the products being launched. "\
+                                             f"Reply only with the full name of the product and nothing else. "\
+                                             f" if there are multiple, separate them with commas. "\
+                                             f"If there aren't any, just reply NA and nothing else\n\n {text_excerpts}"
+                product_names = query_ollama(LLAMA_MODEL, product_name_lookup_prompt)
 
-            product_name_lookup_prompt = f"Take a look at this text and tell me the name of the product being launched. "\
-                                          f"If there aren't any, just reply NA and nothing else\n\n {product_lookup}"
-            product_name = query_ollama(LLAMA_MODEL, product_name_lookup_prompt)
-            if product_name == 'NA':
-                continue
+                if product_names == 'NA':
+                    continue
 
-            product_description_prompt = f"Write a very short description of the product: "\
-                                         f"{product_name}. If {product_name} isn't a product made "\
-                                         f"by {company_name}, then reply \"NA\" and nothing else"
-            product_description = query_ollama(LLAMA_MODEL, product_description_prompt)
-            if product_description == 'NA':
-               continue
+                elif ',' in product_names:
+                    product_names = product_names.split(',')
+                    # Trick to remove duplicates
+                    product_names = list(set(product_names))
+                    for product in product_names:
+                        product_description_prompt = f"Write a very short description of the product: "\
+                                                     f"{product}. If {product} isn't a product made "\
+                                                     f"by {company_name}, then reply \"NA\" and nothing else"
+                        product_description = query_ollama(LLAMA_MODEL, product_description_prompt)
+                        if product_description == 'NA':
+                           continue
+
+                        write_to_output_csv(f'{company_name} | {ticker} | {filing_date} | {product} | {product_description}\n')
+                else:
+                    product = product_names
+                    product_description_prompt = f"Write a very short description of the product: " \
+                                                 f"{product}. If {product} isn't a product made " \
+                                                 f"by {company_name}, then reply \"NA\" and nothing else"
+                    product_description = query_ollama(LLAMA_MODEL, product_description_prompt)
+                    if product_description == 'NA':
+                        continue
+
+                    write_to_output_csv(f'{company_name} | {ticker} | {filing_date} | {product} | {product_description}\n')
 
 
-            with open('output.csv', 'a') as f:
-                f.write(f'{company_name} | {ticker} | {filing_date} | {product_name} | {product_description}\n')
 
